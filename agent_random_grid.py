@@ -24,6 +24,9 @@ class GridAgent:
     def reset_observations(self):
         self.observations = []
 
+    def save_policy(self):
+        pass
+
     def observe_truth(self, abilities):
         # this is your chance to update your policy
         pass
