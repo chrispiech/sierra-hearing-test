@@ -19,6 +19,13 @@ class DefaultAgent:
   
     def update_belief(self, item, response):
         self.observations.append((item, response))
+
+    def observe_truth(self, abilities):
+        # this is your chance to update your policy
+        pass
+
+    def reset_observations(self):
+        pass
   
     def inference(self):
         prediction = {}

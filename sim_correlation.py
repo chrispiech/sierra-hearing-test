@@ -1,63 +1,8 @@
-from agent_random_baseline import DefaultAgent
-from agent_random_gpt import GridAgent
+
 from tqdm import tqdm
 from scipy import stats
 import numpy as np
 from constants import LING_SOUNDS
-
-N_TESTS = 10
-N_ITEMS = 40
-
-agents = {
-    'random-gpt-grid':GridAgent,
-    'random-baseline':DefaultAgent
-}
-
-def main():
-    results = {}
-
-    for name in agents.keys():
-        results[name] = []
-
-    # Run each test with the same sampled abilities for all agents
-    for i in tqdm(range(N_TESTS), desc="Overall progress"):
-        # sample once
-        abilities = sample_abilities()
-
-        # run all agents on same abilities
-        for name, AgentClass in agents.items():
-            agent = AgentClass()
-            run_adaptive_test(abilities, agent)
-            guess = agent.inference()
-            loss = score_guess(guess, abilities)
-            results[name].append(loss)
-
-    # summarize
-    for name, losses in results.items():
-        mean = np.mean(losses)
-        std_err = np.std(losses, ddof=1) / np.sqrt(len(losses))
-        print(f"{name}: mean loss = {mean:.3f} ± {std_err:.3f}")
-
-def score_guess(guess, abilities):
-    loss = 0
-    for ling in LING_SOUNDS:
-        guess_i = guess[ling]
-        truth_i = abilities[ling]
-        loss += (guess_i - truth_i) ** 2
-    return loss / len(guess)
-
-def run_adaptive_test(abilities, agent):
-    responses = []
-    for i in range(N_ITEMS):
-        item = agent.get_next_item()
-        response = simulate_response(abilities, item)
-        responses.append({
-            "item": item,
-            "response": response
-        })
-        agent.update_belief(item, response)
-    return responses
-
 
 def sample_abilities():
     """
