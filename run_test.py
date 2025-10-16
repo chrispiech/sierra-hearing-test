@@ -1,6 +1,7 @@
 
 from agent_ppo import PPOAgent
 from agent_random_grid import GridAgent
+from agent_random_baseline import DefaultAgent
 from tqdm import tqdm
 from scipy import stats
 import numpy as np
@@ -10,8 +11,10 @@ from sim_correlation import sample_abilities
 
 N_TESTS = 10000
 N_ITEMS = 40
+UPDATE_WEIGHTS = False 
 
 agents = {
+    'random-baseline':DefaultAgent,
     'random-grid':GridAgent,
     'ppo':PPOAgent
 }
@@ -29,6 +32,8 @@ def main():
             run_adaptive_test(abilities, agent)
             guess = agent.inference()
             results[name].append(score_guess(guess, abilities))
+            if UPDATE_WEIGHTS:
+                agent.observe_truth(abilities)
 
     # summarize
     for name, losses in results.items():

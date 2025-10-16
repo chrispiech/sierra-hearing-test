@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 from dataclasses import dataclass, asdict
 import numpy as np
-from collections import namedtuple
+from collections import namedtuple, defaultdict
 
 import torch
 import torch.nn as nn
@@ -22,10 +22,10 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # Default checkpoint location
 DEFAULT_CKPT_DIR = Path("checkpoints")
 DEFAULT_CKPT_DIR.mkdir(parents=True, exist_ok=True)
-DEFAULT_CKPT = str(DEFAULT_CKPT_DIR / "ppo.pt")
+DEFAULT_CKPT = str(DEFAULT_CKPT_DIR / "ppo2.pt")
 
 V_MIN, V_MAX = 20, 80
-DB_STEP = 1
+DB_STEP = 1          # tip: try 2 for the first few thousand episodes as a curriculum
 VOL_BINS = (V_MAX - V_MIN) // DB_STEP + 1
 
 SOUND_TO_ID = {s: i for i, s in enumerate(LING_SOUNDS)}
@@ -48,13 +48,12 @@ def rmse(pred: dict, truth: dict):
 def safe_psycho_inference(observations_prefix):
     """
     Wraps psycho_inference to be robust to empty prefixes or occasional errors.
-    Returns a dict sound->pred (float). Falls back to midpoint (40.0) per sound if needed.
+    Returns a dict sound->pred (float). Fallback to 40.0 per sound if needed.
     """
     try:
         if len(observations_prefix) == 0:
             return {s: 40.0 for s in LING_SOUNDS}
         pred = psycho_inference(observations_prefix)
-        # Ensure all sounds present; fill missing with 40.0
         return {s: float(pred.get(s, 40.0)) for s in LING_SOUNDS}
     except Exception:
         return {s: 40.0 for s in LING_SOUNDS}
@@ -72,13 +71,13 @@ class HP:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_eps: float = 0.2
-    ent_coef: float = 0.01
+    ent_coef: float = 0.01       # a bit higher to avoid instant collapse
     vf_coef: float = 0.5
     lr: float = 3e-4
     weight_decay: float = 1e-2
     ppo_epochs: int = 4
     batch_size_tokens: int = 512
-    target_kl: float = 0.01
+    target_kl: float = 0.02
     max_grad_norm: float = 0.5
 
 class TransformerBackbone(nn.Module):
@@ -92,7 +91,7 @@ class TransformerBackbone(nn.Module):
 
         self.fuse = nn.Linear(4*d_model, d_model)
 
-        # after: use post-norm to enable nested-tensor fast path
+        # post-norm to enable nested-tensor fast path (silences the warn)
         enc = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=n_heads,
             dropout=dropout, batch_first=True, norm_first=False
@@ -141,7 +140,7 @@ class TransformerPolicy(nn.Module):
         return a_s, a_v, logp, value
 
 # -----------------------
-# PPO trainer
+# PPO trainer (+ metrics)
 # -----------------------
 Step = namedtuple("Step", "sound vol outcome trial_idx a_sound a_vol logp value reward done")
 
@@ -159,6 +158,8 @@ class PPOTrainer:
             yield {k: v[j] for k, v in batch.items()}
 
     def update(self, batch):
+        # returns a tiny metrics dict
+        all_entropy, all_kl, all_pi, all_v = [], [], [], []
         for _ in range(self.hp.ppo_epochs):
             kl_avg, n = 0.0, 0
             for mb in self._iter_minibatches(batch):
@@ -171,12 +172,14 @@ class PPOTrainer:
                 logits_s, logits_v, value = self.policy(tokens)
                 ds, dv = Categorical(logits=logits_s), Categorical(logits=logits_v)
                 logp = ds.log_prob(mb["a_sound"]) + dv.log_prob(mb["a_vol"])
-                entropy = ds.entropy().mean() + dv.entropy().mean()
+                entropy = (ds.entropy().mean() + dv.entropy().mean())
 
                 ratio = torch.exp(logp - mb["logp"])
                 adv = mb["adv"]
-                loss_pi = -torch.min(ratio * adv,
-                                     torch.clamp(ratio, 1-self.hp.clip_eps, 1+self.hp.clip_eps) * adv).mean()
+                loss_pi = -torch.min(
+                    ratio * adv,
+                    torch.clamp(ratio, 1-self.hp.clip_eps, 1+self.hp.clip_eps) * adv
+                ).mean()
                 loss_v  = F.huber_loss(value, mb["ret"])
                 loss = loss_pi + self.hp.vf_coef * loss_v - self.hp.ent_coef * entropy
 
@@ -188,8 +191,19 @@ class PPOTrainer:
                 with torch.no_grad():
                     kl = (mb["logp"] - logp).mean().clamp_min(0).item()
                     kl_avg += kl; n += 1
+                    all_entropy.append(float(entropy.item()))
+                    all_pi.append(float(loss_pi.item()))
+                    all_v.append(float(loss_v.item()))
             if n and (kl_avg/n) > self.hp.target_kl:
                 break
+            if n: all_kl.append(kl_avg/n)
+        def _mean(xs): return float(np.mean(xs)) if xs else 0.0
+        return {
+            "entropy": _mean(all_entropy),
+            "approx_kl": _mean(all_kl),
+            "loss_pi": _mean(all_pi),
+            "loss_v": _mean(all_v),
+        }
 
 # -----------------------
 # The Agent (your API)
@@ -216,6 +230,15 @@ class PPOAgent:
         self.checkpoint_path = checkpoint_path
         ckpt_dir = Path(os.path.dirname(self.checkpoint_path) or ".")
         ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+        # simple rolling metrics
+        self._episodes = 0
+        self._ema_return = None
+        self._ema_entropy = None
+        self._ema_kl = None
+        self._ema_improve = None
+        self._ema_cover = None
+        self._ema_volcost = None
 
         # auto-load if present
         if autoload and Path(self.checkpoint_path).exists():
@@ -254,11 +277,19 @@ class PPOAgent:
             "optimizer": self.trainer.opt.state_dict(),
             "hp": asdict(self.hp),
             "meta": {"n_sounds": N_SOUNDS, "vol_bins": VOL_BINS, "v_range": (V_MIN, V_MAX)},
+            "trainer_meta": {
+                "episodes": self._episodes,
+                "ema_return": self._ema_return,
+                "ema_entropy": self._ema_entropy,
+                "ema_kl": self._ema_kl,
+                "ema_improve": self._ema_improve,
+                "ema_cover": self._ema_cover,
+                "ema_volcost": self._ema_volcost,
+            }
         }
-        # ensure dir exists
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         torch.save(ckpt, tmp)
-        os.replace(tmp, path)  # atomic move on most OSes
+        os.replace(tmp, path)  # atomic move
 
     def load_policy(self, path: str | None = None, strict: bool = True, load_optimizer: bool = True):
         """
@@ -267,7 +298,6 @@ class PPOAgent:
         path = path or self.checkpoint_path
         ckpt = torch.load(path, map_location=DEVICE)
 
-        # Rebuild with saved HP if they differ (to match parameter shapes)
         if "hp" in ckpt and ckpt["hp"] != asdict(self.hp):
             self.hp = HP(**ckpt["hp"])
             self.model = TransformerPolicy(self.hp).to(DEVICE)
@@ -278,14 +308,21 @@ class PPOAgent:
         if load_optimizer and "optimizer" in ckpt:
             try:
                 self.trainer.opt.load_state_dict(ckpt["optimizer"])
-                # move optimizer tensors onto the correct device
                 for state in self.trainer.opt.state.values():
                     for k, v in state.items():
                         if isinstance(v, torch.Tensor):
                             state[k] = v.to(DEVICE)
             except Exception:
-                # optimizer restore is optional (fine for inference-only)
                 pass
+
+        tm = ckpt.get("trainer_meta", {})
+        self._episodes = int(tm.get("episodes", 0))
+        self._ema_return = tm.get("ema_return", None)
+        self._ema_entropy = tm.get("ema_entropy", None)
+        self._ema_kl = tm.get("ema_kl", None)
+        self._ema_improve = tm.get("ema_improve", None)
+        self._ema_cover = tm.get("ema_cover", None)
+        self._ema_volcost = tm.get("ema_volcost", None)
 
     # ----- acting -----
     def _single_token(self):
@@ -334,24 +371,45 @@ class PPOAgent:
     # ----- training after the exam -----
     def observe_truth(self, abilities):
         """
-        abilities: dict sound->true threshold (dB). Called once at end of exam.
-        Reward r_t = (RMSE_{t-1} - RMSE_t) - alpha * normalized_volume,
-        where RMSE_t is computed using psycho_inference on observations[:t+1].
+        Called once at end of exam.
+        Reward = belief improvement (scaled) + coverage bonus - loudness penalty.
+        This aligns with 'psycho_inference' quality rather than population-average proximity.
         """
         if not self.episode_steps:
             return
 
-        # 1) Build per-step rewards retroactively using psycho_inference
-        alpha = 0.02  # loudness penalty weight
+        # 1) Build per-step rewards
+        # belief improvement (scaled up), coverage with diminishing returns, and loudness penalty.
+        IMPROVE_SCALE = 10.0   # scale RMSE improvement so PPO "feels" it
+        COV_WEIGHT    = 0.3    # weight for coverage bonus
+        ALPHA_VOL     = 0.01   # loudness penalty
+
         rewards = []
+        sound_counts = defaultdict(int)
         prev_err = None
+        improve_terms, cover_terms, volcost_terms = [], [], []
+
         for k in range(len(self.observations)):
-            pred_k = safe_psycho_inference(self.observations[:k+1])
+            prefix = self.observations[:k+1]
+            pred_k = safe_psycho_inference(prefix)
             err_k = rmse(pred_k, abilities)
             improve = 0.0 if prev_err is None else (prev_err - err_k)
-            vol_db = clamp_db(self.observations[k][0]["volume"])
-            vol_cost = alpha * (vol_db - V_MIN) / (V_MAX - V_MIN)
-            rewards.append(float(improve - vol_cost))
+            improve_scaled = IMPROVE_SCALE * improve
+
+            s = prefix[-1][0]["ling_sound"]
+            sound_counts[s] += 1
+            # diminishing returns: bonus when a sound is under-sampled
+            cover = 1.0 / math.sqrt(sound_counts[s])
+
+            v = clamp_db(prefix[-1][0]["volume"])
+            vol_cost = ALPHA_VOL * (v - V_MIN) / (V_MAX - V_MIN)
+
+            r = float(improve_scaled + COV_WEIGHT * cover - vol_cost)
+            rewards.append(r)
+
+            improve_terms.append(float(improve_scaled))
+            cover_terms.append(float(COV_WEIGHT * cover))
+            volcost_terms.append(float(vol_cost))
             prev_err = err_k
 
         # 2) Mark terminal
@@ -364,11 +422,13 @@ class PPOAgent:
         vals = [s.value for s in steps] + [0.0]
         dones = [s.done for s in steps] + [1]
         adv, last = [0.0]*len(steps), 0.0
+        ep_return = 0.0
         for t in reversed(range(len(steps))):
             nonterm = 1 - dones[t+1]
             delta = steps[t].reward + gamma * vals[t+1] * nonterm - vals[t]
             last = delta + gamma * lam * nonterm * last
             adv[t] = last
+            ep_return += steps[t].reward
         ret = [adv[t] + vals[t] for t in range(len(steps))]
 
         def tens(field, dtype=torch.long):
@@ -389,8 +449,31 @@ class PPOAgent:
         }
         batch["adv"] = (batch["adv"] - batch["adv"].mean()) / (batch["adv"].std(unbiased=False) + 1e-8)
 
-        # 4) PPO update
-        self.trainer.update(batch)
+        # 4) PPO update + metrics
+        metrics = self.trainer.update(batch)
+
+        # EMAs for telemetry
+        self._episodes += 1
+        def ema(prev, x, k=0.05):  # 5% smoothing
+            return x if prev is None else (1-k)*prev + k*x
+        self._ema_return  = ema(self._ema_return, ep_return)
+        self._ema_entropy = ema(self._ema_entropy, metrics["entropy"])
+        self._ema_kl      = ema(self._ema_kl, metrics["approx_kl"])
+        self._ema_improve = ema(self._ema_improve, float(np.mean(improve_terms)))
+        self._ema_cover   = ema(self._ema_cover, float(np.mean(cover_terms)))
+        self._ema_volcost = ema(self._ema_volcost, float(np.mean(volcost_terms)))
+
+        # Very slow entropy anneal (keep some exploration)
+        self.hp.ent_coef = max(0.005, self.hp.ent_coef * 0.999)
+
+        if (self._episodes % 50) == 0:
+            print(f"[PPO] ep={self._episodes:5d} "
+                  f"ret_ema={self._ema_return:6.3f} "
+                  f"ent_ema={self._ema_entropy:5.3f} "
+                  f"kl_ema={self._ema_kl:5.3f} "
+                  f"impr_ema={self._ema_improve:6.3f} "
+                  f"cov_ema={self._ema_cover:5.3f} "
+                  f"vol_ema={self._ema_volcost:5.3f}")
 
         # 5) Reset for next exam
         self.reset_observations()
